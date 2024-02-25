@@ -97,15 +97,7 @@ impl NnntpRequest {
                                 if author.get("email").is_none() {
                                     return Err("email is required".to_string());
                                 }
-                            }
-                            Some("comment") => {
-                                if nnntp.get("parent").is_none() {
-                                    return Err("parent is required".to_string());
-                                }
-                                if nnntp.get("body").is_none() {
-                                    return Err("body is required".to_string());
-                                }
-                            }
+                            },
                             Some("list") => {
                                 // nothing to validate
                             },
@@ -116,6 +108,36 @@ impl NnntpRequest {
                                 }
                                 if nnntp.get("password").is_none() {
                                     return Err("password is required".to_string());
+                                }
+                            },
+
+                            Some("comment") => {
+                                if nnntp.get("parent").is_none() {
+                                    return Err("parent is required".to_string());
+                                }
+                                if nnntp.get("comment").is_none() {
+                                    return Err("comment is required".to_string());
+                                }
+                                if nnntp.get("comment").unwrap().get("body").is_none() {
+                                    return Err("body is required".to_string());
+                                }
+
+                                if nnntp.get("author").is_none() {
+                                    return Err("author is required".to_string());
+                                }
+                                
+                                let author = nnntp.get("author").unwrap();
+
+                                if author.get("username").is_none() {
+                                    return Err("username is required".to_string());
+                                }
+
+                                if author.get("password").is_none() {
+                                    return Err("password is required".to_string());
+                                }
+
+                                if author.get("email").is_none() {
+                                    return Err("email is required".to_string());
                                 }
                             }
                             _ => {
@@ -144,6 +166,36 @@ struct Args {
 
     #[clap(long)]
     port: u16,
+}
+
+fn comment_on(
+    parent_id: i32,
+    body: &str,
+    author: &str,
+    password: &str,
+    email: &str,
+) -> Result<(), String> {
+    if !verify_user(author, password).unwrap() {
+        return Err("Invalid user".to_string());
+    }
+
+    let conn = Connection::open("posts.db").unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS comments (
+            parent_id INTEGER NOT NULL,
+            body TEXT NOT NULL,
+            author TEXT NOT NULL,
+            author_email TEXT NOT NULL
+        )",
+        [],
+    ).unwrap();
+
+    conn.execute(
+        "INSERT INTO comments (parent_id, body, author, author_email) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![parent_id, body, author, email],
+    ).unwrap();
+
+    Ok(())
 }
 
 fn save_new_user(username: &str, password: &str) -> Result<(), String> {
@@ -246,6 +298,60 @@ fn main() {
 
     let mut server = Server::new("NNNTP server", args.host, args.port);
 
+    server.route("/comment",
+        |req: JsontpRequest| {
+            let nnntp_req = NnntpRequest::new(req);
+
+            match nnntp_req.validate() {
+                Ok(_) => {
+                    let request = &nnntp_req.inner;
+                    let nnntp = &request.body.other.get("nnntp").unwrap();
+                    let parent_id = nnntp.get("parent").unwrap().get("id").unwrap().as_i64().unwrap() as i32;
+                    let body = nnntp.get("comment").unwrap().get("body").unwrap().as_str().unwrap();
+                    let author_obj = nnntp.get("author").unwrap();
+                    let author = author_obj.get("username").unwrap().as_str().unwrap();
+                    let password = author_obj.get("password").unwrap().as_str().unwrap();
+                    let email = author_obj.get("email").unwrap().as_str().unwrap();
+
+                    match comment_on(parent_id, body, author, password, email) {
+                        Ok(_) => nnntp_req.inner.to_response(
+                            Body::new("Commented OK", "identity", None),
+                            200,
+                            None,
+                            Language::default(),
+                            None,
+                        ),
+                        Err(e) => {
+                            match e.as_str() {
+                                "Invalid user" => nnntp_req.inner.to_response(
+                                    Body::new("Invalid user", "identity", None),
+                                    401,
+                                    None,
+                                    Language::default(),
+                                    None,
+                                ),
+                                _ => nnntp_req.inner.to_response(
+                                    Body::new("Failed to comment", "identity", None),
+                                    400,
+                                    None,
+                                    Language::default(),
+                                    None,
+                                ),
+                            }
+                        }
+                    }
+                }
+                Err(e) => nnntp_req.inner.to_response(
+                    Body::new(format!("bad request - {}", e), "identity", None),
+                    400,
+                    None,
+                    Language::default(),
+                    None,
+                ),
+            }
+        },
+    );
+
     server.route("/post", |req: JsontpRequest| {
         let nnntp_req = NnntpRequest::new(req);
         match nnntp_req.validate() {
@@ -342,7 +448,7 @@ fn main() {
                 }
             }
             Err(e) => nnntp_req.inner.to_response(
-                Body::new("", "identity", None),
+                Body::new(format!("bad request - {}", e), "identity", None),
                 400,
                 None,
                 Language::default(),
@@ -379,7 +485,7 @@ fn main() {
                 }
             }
             Err(e) => nnntp_req.inner.to_response(
-                Body::new("", "identity", None),
+                Body::new(format!("bad request - {}", e), "identity", None),
                 400,
                 None,
                 Language::default(),
@@ -395,8 +501,6 @@ fn main() {
         // do not use query_map because it returns a Result
         let rows = stmt.query([]).unwrap();
 
-
-        let i = 0;
 
         let mut posts = vec![];
 
@@ -426,6 +530,30 @@ fn main() {
             post.insert("body".to_string(), Value::String(body));
             post.insert("author".to_string(), Value::String(author));
             post.insert("author_email".to_string(), Value::String(email));
+
+            // now add the comments
+            let mut stmt = conn.prepare("SELECT * FROM comments WHERE parent_id = ?1").unwrap();
+            let rows = stmt.query([id]).unwrap();
+
+            let mut comments = vec![];
+
+            for comment in rows.mapped(
+                |row| -> Result<(i32, String, String, String), rusqlite::Error> {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                },
+            ) {
+                let (_, body, author, email): (i32, String, String, String) = comment.unwrap();
+
+                let mut comment = serde_json::map::Map::new();
+                comment.insert("body".to_string(), Value::String(body));
+                comment.insert("author".to_string(), Value::String(author));
+                comment.insert("author_email".to_string(), Value::String(email));
+
+                comments.push(Value::Object(comment));
+            }
+
+            post.insert("comments".to_string(), Value::Array(comments));
+
             posts.push(post);
         }
 

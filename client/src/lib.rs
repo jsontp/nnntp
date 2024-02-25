@@ -46,6 +46,15 @@ pub struct Post {
     pub body: String,
     pub author: String,
     pub author_email: Option<String>,
+
+    pub comments: Vec<Comment>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Comment {
+    pub body: String,
+    pub author: String,
+    pub author_email: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +171,81 @@ impl ServerConnection {
         }
     }
 
+    pub fn comment<T: ToString>(&self, parent: i32, body: T) -> Result<(), String> {
+        let author = match self.user.clone() {
+            Some(author) => author,
+            None => return Err("No user provided".to_string()),
+        };
+
+        let client = Request::new()
+            .body_key(
+                "nnntp",
+                Value::Object(
+                    [
+                        ("type".to_string(), Value::String("comment".to_string())),
+                        (
+                            "parent".to_string(),
+                            Value::Object(
+                                [("id".to_string(), Value::Number(parent.into()))]
+                                    .iter()
+                                    .cloned()
+                                    .collect(),
+                            ),
+                        ),
+                        (
+                            "comment".to_string(),
+                            Value::Object(
+                                [("body".to_string(), Value::String(body.to_string()))]
+                                    .iter()
+                                    .cloned()
+                                    .collect(),
+                            ),
+                        ),
+                        (
+                            "author".to_string(),
+                            Value::Object(
+                                [
+                                    (
+                                        "username".to_string(),
+                                        Value::String(author.username.clone()),
+                                    ),
+                                    (
+                                        "password".to_string(),
+                                        Value::String(author.password.clone()),
+                                    ),
+                                    (
+                                        "email".to_string(),
+                                        Value::String(
+                                            author
+                                                .email
+                                                .clone()
+                                                .unwrap_or("no_email@provided.com".to_string()),
+                                        ),
+                                    ),
+                                ]
+                                .iter()
+                                .cloned()
+                                .collect(),
+                            ),
+                        ),
+                    ]
+                    .iter()
+                    .cloned()
+                    .collect(),
+                ),
+            )
+            .resource("/comment");
+
+        let response = client.send(self.host.clone(), self.port).unwrap();
+
+        match response.status.code {
+            200 => Ok(()),
+            400 => Err("Invalid request".to_string()),
+            401 => Err("Unauthorized".to_string()),
+            _ => Err("Unknown error".to_string()),
+        }
+    }
+
     pub fn list<T: ToString>(&self, group: T) -> Result<Posts, String> {
         let client = Request::new()
             .body_key(
@@ -238,12 +322,52 @@ impl ServerConnection {
                 _ => None,
             };
 
+            let comments = match post.get("comments") {
+                Some(comments) => comments.clone(),
+                _ => return Err("Invalid response".to_string()),
+            };
+
+            let mut comments_instance = vec![];
+
+            if !comments.is_array() {
+                return Err("Invalid response".to_string());
+            }
+
+            for comment in comments.as_array().unwrap() {
+                let comment = match comment {
+                    Value::Object(comment) => comment,
+                    _ => return Err("Invalid response".to_string()),
+                };
+
+                let body = match comment.get("body") {
+                    Some(Value::String(body)) => body.clone(),
+                    _ => return Err("Invalid response".to_string()),
+                };
+
+                let author = match comment.get("author") {
+                    Some(Value::String(author)) => author.clone(),
+                    _ => return Err("Invalid response".to_string()),
+                };
+
+                let author_email = match comment.get("author_email") {
+                    Some(Value::String(author_email)) => Some(author_email.clone()),
+                    _ => None,
+                };
+
+                comments_instance.push(Comment {
+                    body,
+                    author,
+                    author_email
+                });
+            }
+
             posts_instance.posts.push(Post {
                 id: id.to_string().parse().unwrap(),
                 subject,
                 body,
                 author,
-                author_email
+                author_email,
+                comments: comments_instance,
             });
         }
 
@@ -288,8 +412,15 @@ mod tests {
 
         let server = ServerConnection::new("localhost", 8080, Some(user));
 
-        println!("Posting: {:?}", server.post("comp.lang.rust", "This doesn't work", "This is a body"));
+        let parent_id = match server.list("comp.lang.rust") {
+            Ok(posts) => posts.posts[0].id,
+            Err(err) => panic!("{}", err),
+        };
 
-        println!("Listing: {:?}", server.list("comp.lang.rust"));
+        println!("Parent id: {}", parent_id);
+
+        server.comment(parent_id, "This is a comment").unwrap();
+
+        println!("Listing: {:#?}", server.list("comp.lang.rust"));
     }
 }
